@@ -13,6 +13,43 @@
 #include <ccan/list/list.h>
 #include <ccan/time/time.h>
 
+enum htlc_stage_type {
+	HTLC_ADD,
+	HTLC_UNADD,
+	HTLC_FULFILL,
+	HTLC_TIMEDOUT,
+	HTLC_FAIL
+};
+
+struct htlc_add {
+	enum htlc_stage_type add;
+	struct channel_htlc htlc;
+};
+
+struct htlc_fulfill {
+	enum htlc_stage_type fulfill;
+	size_t index;
+	struct sha256 r;
+};
+
+struct htlc_timedout {
+	enum htlc_stage_type timedout;
+	size_t index;
+};
+
+struct htlc_fail {
+	enum htlc_stage_type fail;
+	size_t index;
+};
+
+union htlc_staging {
+	enum htlc_stage_type type;
+	struct htlc_add add;
+	struct htlc_fulfill fulfill;
+	struct htlc_timedout timedout;
+	struct htlc_fail fail;
+};
+
 struct peer_visible_state {
 	/* CMD_OPEN_WITH_ANCHOR or CMD_OPEN_WITHOUT_ANCHOR */
 	enum state_input offer_anchor;
@@ -32,11 +69,8 @@ struct peer_visible_state {
 
 struct htlc_progress {
 	/* The HTLC we're working on. */
-	struct channel_htlc *htlc;
+	union htlc_staging stage;
 
-	/* Set if we're fulfilling. */
-	struct sha256 r;
-	
 	/* Our next state. */
 	/* Channel funding state, after we've completed htlc. */
 	struct channel_state *cstate;
