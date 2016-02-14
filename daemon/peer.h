@@ -26,25 +26,30 @@ struct htlc_add {
 	struct channel_htlc htlc;
 };
 
+struct htlc_unadd {
+	enum htlc_stage_type unadd;
+	struct sha256 rhash;
+};
+
 struct htlc_fulfill {
 	enum htlc_stage_type fulfill;
-	size_t index;
 	struct sha256 r;
 };
 
 struct htlc_timedout {
 	enum htlc_stage_type timedout;
-	size_t index;
+	struct sha256 rhash;
 };
 
 struct htlc_fail {
 	enum htlc_stage_type fail;
-	size_t index;
+	struct sha256 rhash;
 };
 
 union htlc_staging {
 	enum htlc_stage_type type;
 	struct htlc_add add;
+	struct htlc_unadd unadd;
 	struct htlc_fulfill fulfill;
 	struct htlc_timedout timedout;
 	struct htlc_fail fail;
@@ -65,20 +70,17 @@ struct peer_visible_state {
 	struct sha256 revocation_hash;
 	/* Revocation hash for next commit tx. */
 	struct sha256 next_revocation_hash;
-	/* Current commit tx. */
+	/* Current commit tx, with their signature. */
 	struct bitcoin_tx *commit;
+	/* Things we're adding. */
+	union htlc_staging *staging;
+	/* cstate after those are added. */
+	struct channel_state *staging_cstate;
 };
 
 struct htlc_progress {
 	/* The HTLC we're working on. */
 	union htlc_staging stage;
-
-	/* Our next state. */
-	/* Channel funding state, after we've completed htlc. */
-	struct channel_state *cstate;
-	struct sha256 our_revocation_hash, their_revocation_hash;
-	struct bitcoin_tx *our_commit, *their_commit;
-	struct bitcoin_signature their_sig;
 };
 
 struct peer {
@@ -144,8 +146,6 @@ struct peer {
 		struct txwatch *watch;
 	} cur_commit;
 
-	/* Current HTLC, if any. */
-	struct htlc_progress *current_htlc;
 	/* Number of HTLC updates (== number of previous commit txs) */
 	u64 commit_tx_counter;
 
@@ -181,6 +181,20 @@ void make_commit_txs(const tal_t *ctx,
 		     const struct sha256 *their_revocation_hash,
 		     const struct channel_state *cstate,
 		     struct bitcoin_tx **ours, struct bitcoin_tx **theirs);
+
+/**
+ * Try to include this staging command; return false if impossible.
+ * @peer: peer we're dealing with.
+ * @staging: ptr to array of staging to add to (ours or theirs)
+ * @sender: requester channel state to update (our next or their next)
+ * @receiver: requestee channel state to update (our next or their next)
+ * @stage: the staging request itself.
+ */
+bool add_staging(struct peer *peer,
+		 union htlc_staging **staging,
+		 struct channel_oneside *sender,
+		 struct channel_oneside *receiver,
+		 const union htlc_staging *stage);
 
 void peer_add_htlc_expiry(struct peer *peer,
 			  const struct abs_locktime *expiry);

@@ -68,31 +68,6 @@ struct signature;
 /* Inform peer have an unexpected packet. */
 void peer_unexpected_pkt(struct peer *peer, const Pkt *pkt);
 
-/* Current HTLC management.
- * The "current" htlc is set before sending CMD_SEND_HTLC_*, or by
- * accept_pkt_htlc_*.
- *
- * After that the state machine manages the current htlc, eventually giving one
- * of the following calls (which should reset the current HTLC):
- *
- * - peer_htlc_declined: sent PKT_UPDATE_DECLINE_HTLC.
- * - peer_htlc_ours_deferred: their update was higher priority, retry later.
- * - peer_htlc_added: a new HTLC was added successfully.
- * - peer_htlc_fulfilled: an existing HTLC was fulfilled successfully.
- * - peer_htlc_timedout: an existing HTLC was timed out successfully.
- * - peer_htlc_fail: an existing HTLC failed to route.
- * - peer_htlc_aborted: eg. comms error
- */
-
-/* Someone declined our HTLC: details in pkt (we will also get CMD_FAIL) */
-void peer_htlc_declined(struct peer *peer, const Pkt *pkt);
-/* Called when their update overrides our update cmd. */
-void peer_htlc_ours_deferred(struct peer *peer);
-/* Successfully added/fulfilled/timedout/fail an HTLC. */
-void peer_htlc_done(struct peer *peer);
-/* Someone aborted an existing HTLC. */
-void peer_htlc_aborted(struct peer *peer);
-
 /* An on-chain transaction revealed an R value. */
 const struct htlc *peer_tx_revealed_r_value(struct peer *peer,
 					    const struct bitcoin_event *btc);
@@ -105,15 +80,16 @@ Pkt *pkt_open_commit_sig(const tal_t *ctx, const struct peer *peer);
 Pkt *pkt_open_complete(const tal_t *ctx, const struct peer *peer);
 Pkt *pkt_htlc_add(const tal_t *ctx, const struct peer *peer,
 		  const struct htlc_progress *htlc_prog);
+Pkt *pkt_htlc_unadd(const tal_t *ctx, const struct peer *peer,
+		    const struct htlc_progress *htlc_prog);
 Pkt *pkt_htlc_fulfill(const tal_t *ctx, const struct peer *peer,
 		      const struct htlc_progress *htlc_prog);
 Pkt *pkt_htlc_timedout(const tal_t *ctx, const struct peer *peer,
 		       const struct htlc_progress *htlc_prog);
 Pkt *pkt_htlc_fail(const tal_t *ctx, const struct peer *peer,
 			const struct htlc_progress *htlc_prog);
-Pkt *pkt_update_accept(const tal_t *ctx, const struct peer *peer);
-Pkt *pkt_update_signature(const tal_t *ctx, const struct peer *peer);
-Pkt *pkt_update_complete(const tal_t *ctx, const struct peer *peer);
+Pkt *pkt_commit(const tal_t *ctx, const struct peer *peer);
+Pkt *pkt_complete(const tal_t *ctx, const struct peer *peer);
 Pkt *pkt_err(const tal_t *ctx, const char *fmt, ...);
 Pkt *pkt_close(const tal_t *ctx, const struct peer *peer);
 Pkt *pkt_close_complete(const tal_t *ctx, const struct peer *peer);
@@ -136,8 +112,10 @@ Pkt *accept_pkt_open_complete(const tal_t *ctx,
 			      struct peer *peer, const Pkt *pkt);
 	
 Pkt *accept_pkt_htlc_add(const tal_t *ctx,
-			 struct peer *peer, const Pkt *pkt,
-			 Pkt **decline);
+			 struct peer *peer, const Pkt *pkt);
+
+Pkt *accept_pkt_htlc_unadd(const tal_t *ctx,
+			 struct peer *peer, const Pkt *pkt);
 
 Pkt *accept_pkt_htlc_fail(const tal_t *ctx,
 			  struct peer *peer, const Pkt *pkt);
@@ -148,15 +126,11 @@ Pkt *accept_pkt_htlc_timedout(const tal_t *ctx,
 Pkt *accept_pkt_htlc_fulfill(const tal_t *ctx,
 			     struct peer *peer, const Pkt *pkt);
 
-Pkt *accept_pkt_update_accept(const tal_t *ctx,
-			      struct peer *peer, const Pkt *pkt);
+Pkt *accept_pkt_commit(const tal_t *ctx,
+		       struct peer *peer, const Pkt *pkt);
 
-Pkt *accept_pkt_update_complete(const tal_t *ctx,
-				struct peer *peer, const Pkt *pkt);
-
-Pkt *accept_pkt_update_signature(const tal_t *ctx,
-				 struct peer *peer,
-				 const Pkt *pkt);
+Pkt *accept_pkt_complete(const tal_t *ctx,
+			 struct peer *peer, const Pkt *pkt);
 
 Pkt *accept_pkt_close(const tal_t *ctx, struct peer *peer, const Pkt *pkt);
 

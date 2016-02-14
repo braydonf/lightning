@@ -237,8 +237,8 @@ $CLI generate 2
 # They poll every second, so give them time to process.
 sleep 2
 
-lcli1 getpeers | $FGREP STATE_NORMAL_HIGHPRIO
-lcli2 getpeers | $FGREP STATE_NORMAL_LOWPRIO
+lcli1 getpeers | $FGREP STATE_NORMAL
+lcli2 getpeers | $FGREP STATE_NORMAL
 
 check_status 949999000 50000000 "" 0 0 ""
 
@@ -247,7 +247,16 @@ SECRET=1de08917a61cb2b62ed5937d38577f6a7bfe59c176781c6d8128018e8b5ccdfd
 RHASH=`lcli1 dev-rhash $SECRET | sed 's/.*"\([0-9a-f]*\)".*/\1/'`
 lcli1 newhtlc $ID2 1000000 $EXPIRY $RHASH
 
-# Check channel status
+# Not committed yet, so no change.
+check_status 949999000 50000000 "" 0 0 ""
+
+# Now commit it, one way.  node2 will consider it committed.
+lcli1 commit $ID2
+check_status_single "$LCLI1" 949999000 50000000 "" 0 0 ""
+check_status_single "$LCLI2" 948999000 50000000 '{ "msatoshis" : 1000000, "expiry" : { "second" : '$EXPIRY' }, "rhash" : "'$RHASH'" } ' 0 0 ""
+
+# Now return the favour.
+lcli2 commit $ID1
 check_status 948999000 50000000 '{ "msatoshis" : 1000000, "expiry" : { "second" : '$EXPIRY' }, "rhash" : "'$RHASH'" } ' 0 0 ""
 
 lcli2 fulfillhtlc $ID1 $SECRET

@@ -351,7 +351,6 @@ static struct peer *new_peer(struct lightningd_state *dstate,
 	peer->outpkt = tal_arr(peer, Pkt *, 0);
 	peer->curr_cmd.cmd = INPUT_NONE;
 	list_head_init(&peer->pending_cmd);
-	peer->current_htlc = NULL;
 	peer->commit_tx_counter = 0;
 	peer->close_tx = NULL;
 	peer->cstate = NULL;
@@ -374,6 +373,8 @@ static struct peer *new_peer(struct lightningd_state *dstate,
 	peer->us.commit_fee = dstate->config.commitment_fee;
 
 	peer->us.commit = peer->them.commit = NULL;
+	peer->us.staging = tal_arr(peer, union htlc_staging, 0);
+	peer->them.staging = tal_arr(peer, union htlc_staging, 0);
 	
 	/* FIXME: Attach IO logging for this peer. */
 	tal_add_destructor(peer, destroy_peer);
@@ -955,32 +956,6 @@ void peer_unexpected_pkt(struct peer *peer, const Pkt *pkt)
 	FIXME_STUB(peer);
 }
 
-/* Someone declined our HTLC: details in pkt (we will also get CMD_FAIL) */
-void peer_htlc_declined(struct peer *peer, const Pkt *pkt)
-{
-	log_unusual(peer->log, "Peer declined htlc, reason %i",
-		    pkt->update_decline_htlc->reason_case);
-	peer->current_htlc = tal_free(peer->current_htlc);
-}
-
-/* Called when their update overrides our update cmd. */
-void peer_htlc_ours_deferred(struct peer *peer)
-{
-	FIXME_STUB(peer);
-}
-
-/* Successfully added/fulfilled/timedout/routefail an HTLC. */
-void peer_htlc_done(struct peer *peer)
-{
-	peer->current_htlc = tal_free(peer->current_htlc);
-}
-
-/* Someone aborted an existing HTLC. */
-void peer_htlc_aborted(struct peer *peer)
-{
-	FIXME_STUB(peer);
-}
-
 /* An on-chain transaction revealed an R value. */
 const struct htlc *peer_tx_revealed_r_value(struct peer *peer,
 					    const struct bitcoin_event *btc)
@@ -1126,6 +1101,10 @@ static void created_anchor(struct lightningd_state *dstate,
 				       commitfee);
 	if (!peer->cstate)
 		fatal("Insufficient anchor funds for commitfee");
+
+	/* Staging starts with same state we're in now. */
+	peer->us.staging_cstate = copy_funding(peer, peer->cstate);
+	peer->them.staging_cstate = copy_funding(peer, peer->cstate);
 
 	/* Now we can make initial (unsigned!) commit txs. */
 	make_commit_txs(peer, peer,
@@ -1284,27 +1263,193 @@ const struct json_command getpeers_command = {
 	"Returns a 'peers' array"
 };
 
+static size_t find_stage_add(const union htlc_staging *staging,
+			     const struct sha256 *rhash)
+{
+	size_t i, n = tal_count(staging);
+
+	for (i = 0; i < n; i++) {
+		if (staging[i].type != HTLC_ADD)
+			continue;
+
+		if (structeq(rhash, &staging[i].add.htlc.rhash))
+			break;
+	}
+	return i;
+}
+
+static u64 total_funds(const struct channel_oneside *c)
+{
+	u64 total = (u64)c->pay_msat + c->fee_msat;
+	size_t i, n = tal_count(c->htlcs);
+
+	for (i = 0; i < n; i++)
+		total += c->htlcs[i].msatoshis;
+	return total;
+}
+
+bool add_staging(struct peer *peer,
+		 union htlc_staging **staging,
+		 struct channel_oneside *a,
+		 struct channel_oneside *b,
+		 const union htlc_staging *stage)
+{
+	size_t i, n;
+	u64 total_before_a, total_before_b;
+
+	total_before_a = total_funds(a);
+	total_before_b = total_funds(b);
+
+	switch (stage->type) {
+	case HTLC_ADD:
+		/* FIXME: Check for duplicate r values? */
+		if (!funding_delta(peer->anchor.satoshis,
+				   0, stage->add.htlc.msatoshis,
+				   a, b)) {
+			log_debug(peer->log,
+				  "add_staging: cannot afford to add %"PRIu64,
+				  stage->add.htlc.msatoshis);
+			return false;
+		}
+		funding_add_htlc(a, stage->add.htlc.msatoshis,
+				 &stage->add.htlc.expiry,
+				 &stage->add.htlc.rhash);
+		peer_add_htlc_expiry(peer, &stage->add.htlc.expiry);
+		goto append_stage;
+	case HTLC_UNADD:
+		/* Special case; we remove add staging immediately. */
+		i = funding_find_htlc(a, &stage->unadd.rhash);
+		if (i == tal_count(a->htlcs)) {
+			/* FIXME: log hash */
+			log_debug(peer->log,
+				  "add_staging: cannot find to unadd");
+			return false;
+		}
+
+		if (!funding_delta(peer->anchor.satoshis,
+				   0,
+				   -a->htlcs[i].msatoshis,
+				   a, b)) {
+			fatal("Unexpected failure unadding"
+			      " HTLC of %"PRIu64
+			      " milli-satoshis",
+			      a->htlcs[i].msatoshis);
+		}
+		funding_remove_htlc(a, i);
+
+		/* Now remove the add directly. */
+		i = find_stage_add(*staging, &stage->unadd.rhash);
+		n = tal_count(*staging);
+		assert(i < n);
+		memmove((*staging) + i,
+			(*staging) + i + 1,
+			sizeof(**staging) * (i + 1 - n));
+		tal_resize(staging, n-1);
+		goto check;
+	case HTLC_FULFILL: {
+		struct sha256 rhash;
+		sha256(&rhash, &stage->fulfill.r, sizeof(stage->fulfill.r));
+		i = funding_find_htlc(b, &rhash);
+		if (i == tal_count(b->htlcs)) {
+			log_debug(peer->log,
+				  "add_staging: cannot find to fulfill");
+			return false;
+		}
+
+		if (!funding_delta(peer->anchor.satoshis,
+				   -b->htlcs[i].msatoshis,
+				   -b->htlcs[i].msatoshis,
+				   b, a)) {
+			fatal("Unexpected failure fulfilling"
+			      " HTLC of %"PRIu64
+			      " milli-satoshis",
+			      b->htlcs[i].msatoshis);
+		}
+		funding_remove_htlc(b, i);
+		goto append_stage;
+	}
+	case HTLC_TIMEDOUT:
+		i = funding_find_htlc(a, &stage->timedout.rhash);
+		if (i == tal_count(a->htlcs)) {
+			log_debug(peer->log,
+				  "add_staging: cannot find to timeout");
+			return false;
+		}
+
+		/* FIXME: Handle block-based timeouts. */
+		if (!abs_locktime_is_seconds(&a->htlcs[i].expiry)) {
+			log_unusual(peer->log,
+				    "add_staging: handle block timeout!");
+			return false;
+		}
+
+		/* Has it actually timed out? */
+		if (controlled_time().ts.tv_sec
+		    < abs_locktime_to_seconds(&a->htlcs[i].expiry)) {
+			log_debug(peer->log,
+				  "add_staging: cannot timeout %u (now %lu)",
+				  abs_locktime_to_seconds(&a->htlcs[i].expiry),
+				  (unsigned long)controlled_time().ts.tv_sec);
+			
+			return false;
+		}
+		goto append_stage;
+	case HTLC_FAIL:
+		i = funding_find_htlc(b, &stage->timedout.rhash);
+		if (i == tal_count(b->htlcs)) {
+			log_debug(peer->log, "add_staging: cannot find to fail");
+			return false;
+		}
+		goto append_stage;
+	}
+
+	log_unusual(peer->log, "Unexpected staging type %u", stage->type);
+	return false;
+
+append_stage:
+	n = tal_count(*staging);
+	tal_resize(staging, n+1);
+	(*staging)[n] = *stage;
+
+check:
+	/* HTLCs can't change total balance in channel! */
+	if (total_funds(a) + total_funds(b)
+	    != total_before_a + total_before_b) {
+		fatal("Illegal funding transition from totals %"PRIu64"/%"PRIu64
+		      " to %"PRIu64"/%"PRIu64" for staged %u",
+		      total_before_a, total_before_b,
+		      total_funds(a),
+		      total_funds(b),
+		      stage->type);
+	}
+	return true;
+}
+
 static void set_htlc_command(struct peer *peer,
-			     struct channel_state *cstate,
 			     struct command *jsoncmd,
 			     enum state_input cmd,
 			     const union htlc_staging *stage)
 {
-	assert(!peer->current_htlc);
+	/* FIXME: memleak! */
+	/* FIXME: Get rid of struct htlc_progress */
+	struct htlc_progress *progress = tal(peer, struct htlc_progress);
 
-	peer->current_htlc = tal(peer, struct htlc_progress);
-	peer->current_htlc->cstate = tal_steal(peer->current_htlc, cstate);
-	peer->current_htlc->stage = *stage;
-
-	peer_get_revocation_hash(peer, peer->commit_tx_counter+1,
-				 &peer->current_htlc->our_revocation_hash);
-
-	/* FIXME: Do we need current_htlc as idata arg? */
-	set_current_command(peer, cmd, peer->current_htlc, jsoncmd);
+	progress->stage = *stage;
+	set_current_command(peer, cmd, progress, jsoncmd);
 }
 		
 /* FIXME: Keep a timeout for each peer, in case they're unresponsive. */
-	
+
+/* FIXME: We also need to ensure our current commit tx never holds an
+ * HTLC from us which would expire before we could use the OP_CSV
+ * path to redeem it.  Otherwise we could drop it to the blockchain,
+ * they could use the R value to spend it before we can, but the R
+ * value may now be useless to us.
+ *
+ * Technically, we want to ensure:
+ * {now} + {delay commit entering chain} + {OP_CSV-delay} + {redeem tx delay}
+ *   < {htlc-expiry of offered-to-us HTLC} + {delay commit entering chain}
+ */
 static void check_htlc_expiry(struct peer *peer, void *unused)
 {
 	size_t i;
@@ -1313,10 +1458,9 @@ static void check_htlc_expiry(struct peer *peer, void *unused)
 	stage.timedout.timedout = HTLC_TIMEDOUT;
 
 	/* Check our htlcs for expiry. */
-	for (i = 0; i < tal_count(peer->cstate->a.htlcs); i++) {
-		struct channel_htlc *htlc = &peer->cstate->a.htlcs[i];
-		struct channel_state *cstate;
-
+	for (i = 0; i < tal_count(peer->us.staging_cstate->a.htlcs); i++) {
+		struct channel_htlc *htlc = &peer->us.staging_cstate->a.htlcs[i];
+ 
 		/* Not a seconds-based expiry? */
 		if (!abs_locktime_is_seconds(&htlc->expiry))
 			continue;
@@ -1326,20 +1470,19 @@ static void check_htlc_expiry(struct peer *peer, void *unused)
 		    < abs_locktime_to_seconds(&htlc->expiry))
 			continue;
 
-		cstate = copy_funding(peer, peer->cstate);
+		/* May have already timed this one out, so it can fail. */
+		stage.timedout.rhash = htlc->rhash;
+		if (!add_staging(peer,
+				 &peer->them.staging,
+				 &peer->them.staging_cstate->a,
+				 &peer->them.staging_cstate->b,
+				 &stage))
+			continue;
 
-		/* This should never fail! */
-		if (!funding_delta(peer->anchor.satoshis,
-				   0,
-				   -htlc->msatoshis,
-				   &cstate->a, &cstate->b)) {
-			fatal("Unexpected failure expiring HTLC of %"PRIu64
-			      " milli-satoshis", htlc->msatoshis);
-		}
-		funding_remove_htlc(&cstate->a, i);
-		stage.timedout.index = i;
-		set_htlc_command(peer, cstate, NULL, CMD_SEND_HTLC_TIMEDOUT,
-				 &stage);
+		/* FIXME: If it's staged-only, we just UNADD it. */
+		set_htlc_command(peer, NULL, CMD_SEND_HTLC_TIMEDOUT, &stage);
+
+		/* We can only do one command at a time. */
 		return;
 	}
 }
@@ -1362,51 +1505,49 @@ void peer_add_htlc_expiry(struct peer *peer,
 	oneshot_timeout(peer->dstate, peer, when, htlc_expiry_timeout, peer);
 }
 
-struct newhtlc {
-	struct channel_htlc htlc;
+struct stagecmd {
+	enum state_input htlc_cmd;
+	union htlc_staging stage;
 	struct command *jsoncmd;
 };
 
-/* We do final checks just before we start command, as things may have
+/* This does final checks just before we start command, as things may have
  * changed. */
-static void do_newhtlc(struct peer *peer, struct newhtlc *newhtlc)
+static void do_stagecmd(struct peer *peer, struct stagecmd *stagecmd)
 {
-	struct channel_state *cstate;
-	union htlc_staging stage;
-
-	stage.add.add = HTLC_ADD;
-	stage.add.htlc = newhtlc->htlc;
-
 	/* Can we even offer this much?  We check now, just before we
 	 * execute. */
-	cstate = copy_funding(newhtlc, peer->cstate);
-	if (!funding_delta(peer->anchor.satoshis,
-			   0, newhtlc->htlc.msatoshis,
-			   &cstate->a, &cstate->b)) {
-		command_fail(newhtlc->jsoncmd,
-			     "Cannot afford %"PRIu64" milli-satoshis",
-			     newhtlc->htlc.msatoshis);
+	if (!add_staging(peer, &peer->them.staging,
+			 &peer->them.staging_cstate->a,
+			 &peer->them.staging_cstate->b,
+			 &stagecmd->stage)) {
+		/* FIXME: Better error message! */
+		command_fail(stagecmd->jsoncmd, "Failed to stage");
 		return;
 	}
-
-	/* FIXME: Never propose duplicate rvalues? */
-
-	/* Add the htlc to our side of channel. */
-	funding_add_htlc(&cstate->a, newhtlc->htlc.msatoshis,
-			 &newhtlc->htlc.expiry, &newhtlc->htlc.rhash);
-	peer_add_htlc_expiry(peer, &newhtlc->htlc.expiry);
-
-	set_htlc_command(peer, cstate, newhtlc->jsoncmd,
-			 CMD_SEND_HTLC_ADD, &stage);
+	set_htlc_command(peer, stagecmd->jsoncmd, stagecmd->htlc_cmd,
+			 &stagecmd->stage);
 }
 
+static struct stagecmd *new_stagecmd(struct command *cmd,
+				     enum state_input htlc_cmd,
+				     enum htlc_stage_type type)
+{
+	/* Attach to cmd, so survives until it's complete. */
+	struct stagecmd *stagecmd = tal(cmd, struct stagecmd);
+	stagecmd->jsoncmd = cmd;
+	stagecmd->htlc_cmd = CMD_SEND_HTLC_ADD;
+	stagecmd->stage.type = HTLC_ADD;
+	return stagecmd;
+}
+	
 static void json_newhtlc(struct command *cmd,
 			 const char *buffer, const jsmntok_t *params)
 {
 	struct peer *peer;
 	jsmntok_t *peeridtok, *msatoshistok, *expirytok, *rhashtok;
 	unsigned int expiry;
-	struct newhtlc *newhtlc;
+	struct stagecmd *stagecmd;
 
 	if (!json_get_params(buffer, params,
 			     "peerid", &peeridtok,
@@ -1424,11 +1565,10 @@ static void json_newhtlc(struct command *cmd,
 		return;
 	}
 
-	/* Attach to cmd until it's complete. */
-	newhtlc = tal(cmd, struct newhtlc);
-	newhtlc->jsoncmd = cmd;
+	stagecmd = new_stagecmd(cmd, CMD_SEND_HTLC_ADD, HTLC_ADD);
 
-	if (!json_tok_u64(buffer, msatoshistok, &newhtlc->htlc.msatoshis)) {
+	if (!json_tok_u64(buffer, msatoshistok,
+			  &stagecmd->stage.add.htlc.msatoshis)) {
 		command_fail(cmd, "'%.*s' is not a valid number",
 			     (int)(msatoshistok->end - msatoshistok->start),
 			     buffer + msatoshistok->start);
@@ -1441,20 +1581,20 @@ static void json_newhtlc(struct command *cmd,
 		return;
 	}
 
-	if (!seconds_to_abs_locktime(expiry, &newhtlc->htlc.expiry)) {
+	if (!seconds_to_abs_locktime(expiry, &stagecmd->stage.add.htlc.expiry)) {
 		command_fail(cmd, "'%.*s' is not a valid number",
 			     (int)(expirytok->end - expirytok->start),
 			     buffer + expirytok->start);
 		return;
 	}
 
-	if (abs_locktime_to_seconds(&newhtlc->htlc.expiry) <
+	if (abs_locktime_to_seconds(&stagecmd->stage.add.htlc.expiry) <
 	    controlled_time().ts.tv_sec + peer->dstate->config.min_expiry) {
 		command_fail(cmd, "HTLC expiry too soon!");
 		return;
 	}
 
-	if (abs_locktime_to_seconds(&newhtlc->htlc.expiry) >
+	if (abs_locktime_to_seconds(&stagecmd->stage.add.htlc.expiry) >
 	    controlled_time().ts.tv_sec + peer->dstate->config.max_expiry) {
 		command_fail(cmd, "HTLC expiry too far!");
 		return;
@@ -1462,15 +1602,15 @@ static void json_newhtlc(struct command *cmd,
 
 	if (!hex_decode(buffer + rhashtok->start,
 			rhashtok->end - rhashtok->start,
-			&newhtlc->htlc.rhash,
-			sizeof(newhtlc->htlc.rhash))) {
+			&stagecmd->stage.add.htlc.rhash,
+			sizeof(stagecmd->stage.add.htlc.rhash))) {
 		command_fail(cmd, "'%.*s' is not a valid sha256 hash",
 			     (int)(rhashtok->end - rhashtok->start),
 			     buffer + rhashtok->start);
 		return;
 	}
 
-	queue_cmd(peer, do_newhtlc, newhtlc);
+	queue_cmd(peer, do_stagecmd, stagecmd);
 }
 
 const struct json_command newhtlc_command = {
@@ -1480,57 +1620,12 @@ const struct json_command newhtlc_command = {
 	"Returns an empty result on success"
 };
 
-struct fulfillhtlc {
-	struct command *jsoncmd;
-	struct sha256 r;
-};
-
-static void do_fullfill(struct peer *peer,
-			struct fulfillhtlc *fulfillhtlc)
-{
-	struct channel_state *cstate;
-	struct sha256 rhash;
-	size_t i;
-	struct channel_htlc *htlc;
-	union htlc_staging stage;
-
-	stage.fulfill.fulfill = HTLC_FULFILL;
-	stage.fulfill.r = fulfillhtlc->r;
-
-	sha256(&rhash, &fulfillhtlc->r, sizeof(fulfillhtlc->r));
-
-	i = funding_find_htlc(&peer->cstate->b, &rhash);
-	if (i == tal_count(peer->cstate->b.htlcs)) {
-		command_fail(fulfillhtlc->jsoncmd,
-			     "preimage htlc not found");
-		return;
-	}
-	stage.fulfill.index = i;
-	/* Point at current one, since we remove from new cstate. */
-	htlc = &peer->cstate->b.htlcs[i];
-
-	cstate = copy_funding(fulfillhtlc, peer->cstate);
-	/* This should never fail! */
-	if (!funding_delta(peer->anchor.satoshis,
-			   -htlc->msatoshis,
-			   -htlc->msatoshis,
-			   &cstate->b, &cstate->a)) {
-		fatal("Unexpected failure fulfilling HTLC of %"PRIu64
-		      " milli-satoshis", htlc->msatoshis);
-		return;
-	}
-	funding_remove_htlc(&cstate->b, i);
-
-	set_htlc_command(peer, cstate, fulfillhtlc->jsoncmd,
-			 CMD_SEND_HTLC_FULFILL, &stage);
-}
-
 static void json_fulfillhtlc(struct command *cmd,
 			     const char *buffer, const jsmntok_t *params)
 {
 	struct peer *peer;
 	jsmntok_t *peeridtok, *rtok;
-	struct fulfillhtlc *fulfillhtlc;
+	struct stagecmd *stagecmd;
 
 	if (!json_get_params(buffer, params,
 			     "peerid", &peeridtok,
@@ -1546,19 +1641,19 @@ static void json_fulfillhtlc(struct command *cmd,
 		return;
 	}
 
-	fulfillhtlc = tal(cmd, struct fulfillhtlc);
-	fulfillhtlc->jsoncmd = cmd;
+	stagecmd = new_stagecmd(cmd, CMD_SEND_HTLC_FULFILL, HTLC_FULFILL);
 
 	if (!hex_decode(buffer + rtok->start,
 			rtok->end - rtok->start,
-			&fulfillhtlc->r, sizeof(fulfillhtlc->r))) {
+			&stagecmd->stage.fulfill.r,
+			sizeof(stagecmd->stage.fulfill.r))) {
 		command_fail(cmd, "'%.*s' is not a valid sha256 preimage",
 			     (int)(rtok->end - rtok->start),
 			     buffer + rtok->start);
 		return;
 	}
 
-	queue_cmd(peer, do_fullfill, fulfillhtlc);
+	queue_cmd(peer, do_stagecmd, stagecmd);
 }
 	
 const struct json_command fulfillhtlc_command = {
@@ -1568,53 +1663,12 @@ const struct json_command fulfillhtlc_command = {
 	"Returns an empty result on success"
 };
 
-struct failhtlc {
-	struct command *jsoncmd;
-	struct sha256 rhash;
-};
-
-static void do_failhtlc(struct peer *peer,
-			struct failhtlc *failhtlc)
-{
-	struct channel_state *cstate;
-	size_t i;
-	struct channel_htlc *htlc;
-	union htlc_staging stage;
-
-	stage.fail.fail = HTLC_FAIL;
-
-	i = funding_find_htlc(&peer->cstate->b, &failhtlc->rhash);
-	if (i == tal_count(peer->cstate->b.htlcs)) {
-		command_fail(failhtlc->jsoncmd, "htlc not found");
-		return;
-	}
-	stage.fail.index = i;
-	/* Point to current one, since we remove from new cstate. */
-	htlc = &peer->cstate->b.htlcs[i];
-
-	cstate = copy_funding(failhtlc, peer->cstate);
-
-	/* This should never fail! */
-	if (!funding_delta(peer->anchor.satoshis,
-			   0,
-			   -htlc->msatoshis,
-			   &cstate->b, &cstate->a)) {
-		fatal("Unexpected failure routefailing HTLC of %"PRIu64
-		      " milli-satoshis", htlc->msatoshis);
-		return;
-	}
-	funding_remove_htlc(&cstate->b, i);
-
-	set_htlc_command(peer, cstate, failhtlc->jsoncmd,
-			 CMD_SEND_HTLC_FAIL, &stage);
-}
-
 static void json_failhtlc(struct command *cmd,
 			  const char *buffer, const jsmntok_t *params)
 {
 	struct peer *peer;
 	jsmntok_t *peeridtok, *rhashtok;
-	struct failhtlc *failhtlc;
+	struct stagecmd *stagecmd;
 
 	if (!json_get_params(buffer, params,
 			     "peerid", &peeridtok,
@@ -1630,25 +1684,105 @@ static void json_failhtlc(struct command *cmd,
 		return;
 	}
 
-	failhtlc = tal(cmd, struct failhtlc);
-	failhtlc->jsoncmd = cmd;
-
+	stagecmd = new_stagecmd(cmd, CMD_SEND_HTLC_FAIL, HTLC_FAIL);
 	if (!hex_decode(buffer + rhashtok->start,
 			rhashtok->end - rhashtok->start,
-			&failhtlc->rhash, sizeof(failhtlc->rhash))) {
+			&stagecmd->stage.fail.rhash,
+			sizeof(stagecmd->stage.fail.rhash))) {
 		command_fail(cmd, "'%.*s' is not a valid sha256 preimage",
 			     (int)(rhashtok->end - rhashtok->start),
 			     buffer + rhashtok->start);
 		return;
 	}
 
-	queue_cmd(peer, do_failhtlc, failhtlc);
+	queue_cmd(peer, do_stagecmd, stagecmd);
 }
-	
+
 const struct json_command failhtlc_command = {
 	"failhtlc",
 	json_failhtlc,
 	"Fail htlc proposed by {peerid} which has redeem hash {rhash}",
+	"Returns an empty result on success"
+};
+
+static void json_unaddhtlc(struct command *cmd,
+			   const char *buffer, const jsmntok_t *params)
+{
+	struct peer *peer;
+	jsmntok_t *peeridtok, *rhashtok;
+	struct stagecmd *stagecmd;
+
+	if (!json_get_params(buffer, params,
+			     "peerid", &peeridtok,
+			     "rhash", &rhashtok,
+			     NULL)) {
+		command_fail(cmd, "Need peerid and rhash");
+		return;
+	}
+
+	peer = find_peer(cmd->dstate, buffer, peeridtok);
+	if (!peer) {
+		command_fail(cmd, "Could not find peer with that peerid");
+		return;
+	}
+
+	stagecmd = new_stagecmd(cmd, CMD_SEND_HTLC_UNADD, HTLC_UNADD);
+	if (!hex_decode(buffer + rhashtok->start,
+			rhashtok->end - rhashtok->start,
+			&stagecmd->stage.unadd.rhash,
+			sizeof(stagecmd->stage.unadd.rhash))) {
+		command_fail(cmd, "'%.*s' is not a valid sha256 preimage",
+			     (int)(rhashtok->end - rhashtok->start),
+			     buffer + rhashtok->start);
+		return;
+	}
+
+	queue_cmd(peer, do_stagecmd, stagecmd);
+}
+	
+const struct json_command unaddhtlc_command = {
+	"unaddhtlc",
+	json_unaddhtlc,
+	"Unadd htlc proposed to {peerid} which has redeem hash {rhash}",
+	"Returns an empty result on success"
+};
+
+static void do_commit(struct peer *peer, struct command *jsoncmd)
+{
+	if (tal_count(peer->them.staging) == 0) {
+		command_fail(jsoncmd, "no changes to commit");
+		return;
+	}
+
+	set_current_command(peer, CMD_SEND_COMMIT, NULL, jsoncmd);
+}
+
+static void json_commit(struct command *cmd,
+			const char *buffer, const jsmntok_t *params)
+{
+	struct peer *peer;
+	jsmntok_t *peeridtok;
+
+	if (!json_get_params(buffer, params,
+			    "peerid", &peeridtok,
+			    NULL)) {
+		command_fail(cmd, "Need peerid");
+		return;
+	}
+
+	peer = find_peer(cmd->dstate, buffer, peeridtok);
+	if (!peer) {
+		command_fail(cmd, "Could not find peer with that peerid");
+		return;
+	}
+
+	queue_cmd(peer, do_commit, cmd);
+}
+	
+const struct json_command commit_command = {
+	"commit",
+	json_commit,
+	"Commit all staged HTLC changes with {peerid}",
 	"Returns an empty result on success"
 };
 

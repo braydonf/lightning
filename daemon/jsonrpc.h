@@ -59,8 +59,10 @@ void setup_jsonrpc(struct lightningd_state *dstate, const char *rpc_filename);
 extern const struct json_command connect_command;
 extern const struct json_command getpeers_command;
 extern const struct json_command newhtlc_command;
+extern const struct json_command unaddhtlc_command;
 extern const struct json_command fulfillhtlc_command;
 extern const struct json_command failhtlc_command;
+extern const struct json_command commit_command;
 extern const struct json_command mocktime_command;
 extern const struct json_command close_command;
 #endif /* LIGHTNING_DAEMON_JSONRPC_H */
