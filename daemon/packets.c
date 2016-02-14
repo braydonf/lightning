@@ -563,13 +563,13 @@ Pkt *accept_pkt_htlc_timedout(const tal_t *ctx,
 	proto_to_sha256(t->revocation_hash, &cur->their_revocation_hash);
 	proto_to_sha256(t->r_hash, &rhash);
 
-	i = funding_find_htlc(&peer->cstate->a, &rhash);
-	if (i == tal_count(peer->cstate->a.htlcs)) {
+	i = funding_find_htlc(&peer->cstate->b, &rhash);
+	if (i == tal_count(peer->cstate->b.htlcs)) {
 		err = pkt_err(ctx, "Unknown HTLC");
 		goto fail;
 	}
 
-	cur->htlc = tal_dup(cur, struct channel_htlc, &peer->cstate->a.htlcs[i]);
+	cur->htlc = tal_dup(cur, struct channel_htlc, &peer->cstate->b.htlcs[i]);
 
 	/* Do we agree it has timed out? */
 	if (controlled_time().ts.tv_sec < abs_locktime_to_seconds(&cur->htlc->expiry)) {
@@ -577,16 +577,16 @@ Pkt *accept_pkt_htlc_timedout(const tal_t *ctx,
 		goto fail;
 	}
 
-	/* Removing it should not fail: we regain HTLC amount */
+	/* Removing it should not fail: they regain HTLC amount */
 	cur->cstate = copy_funding(cur, peer->cstate);
-	if (!funding_delta(peer->us.offer_anchor == CMD_OPEN_WITH_ANCHOR,
+	if (!funding_delta(peer->them.offer_anchor == CMD_OPEN_WITH_ANCHOR,
 			   peer->anchor.satoshis,
 			   0, -cur->htlc->msatoshis,
-			   &cur->cstate->a, &cur->cstate->b)) {
+			   &cur->cstate->b, &cur->cstate->a)) {
 		fatal("Unexpected failure fulfilling HTLC of %"PRIu64
 		      " milli-satoshis", cur->htlc->msatoshis);
 	}
-	funding_remove_htlc(&cur->cstate->a, i);
+	funding_remove_htlc(&cur->cstate->b, i);
 	/* FIXME: Remove timer. */
 
 	peer_get_revocation_hash(peer, peer->commit_tx_counter+1,

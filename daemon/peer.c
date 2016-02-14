@@ -1305,9 +1305,9 @@ static void check_htlc_expiry(struct peer *peer, void *unused)
 {
 	size_t i;
 
-	/* Check their htlcs for expiry. */
-	for (i = 0; i < tal_count(peer->cstate->b.htlcs); i++) {
-		struct channel_htlc *htlc = &peer->cstate->b.htlcs[i];
+	/* Check our htlcs for expiry. */
+	for (i = 0; i < tal_count(peer->cstate->a.htlcs); i++) {
+		struct channel_htlc *htlc = &peer->cstate->a.htlcs[i];
 		struct channel_state *cstate;
 
 		/* Not a seconds-based expiry? */
@@ -1322,16 +1322,16 @@ static void check_htlc_expiry(struct peer *peer, void *unused)
 		cstate = copy_funding(peer, peer->cstate);
 
 		/* This should never fail! */
-		if (!funding_delta(peer->them.offer_anchor
+		if (!funding_delta(peer->us.offer_anchor
 				   == CMD_OPEN_WITH_ANCHOR,
 				   peer->anchor.satoshis,
 				   0,
 				   -htlc->msatoshis,
-				   &cstate->b, &cstate->a)) {
-			fatal("Unexpected failure expirint HTLC of %"PRIu64
+				   &cstate->a, &cstate->b)) {
+			fatal("Unexpected failure expiring HTLC of %"PRIu64
 			      " milli-satoshis", htlc->msatoshis);
 		}
-		funding_remove_htlc(&cstate->b, i);
+		funding_remove_htlc(&cstate->a, i);
 
 		set_htlc_command(peer, cstate, NULL, htlc,
 				 CMD_SEND_HTLC_TIMEDOUT, NULL);
